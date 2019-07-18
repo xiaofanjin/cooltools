@@ -1,7 +1,7 @@
 .PHONY: init install clean-pyc clean-dist clean build test publish docs-init docs
 
 init:
-	conda install --file requirements.txt
+	conda install -n hic --file requirements.txt
 
 build:
 	python setup.py build_ext --inplace
