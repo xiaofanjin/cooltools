@@ -1,0 +1,12 @@
+numpy
+scipy
+cython
+matplotlib
+pandas
+h5py
+numba
+dask
+scikit-learn
+cooler
+click
+pytest
