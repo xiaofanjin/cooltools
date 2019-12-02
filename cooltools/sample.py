@@ -1,21 +1,32 @@
 import numpy as np
 import pandas as pd
 
-import cooler, cooler.tools
+import cooler
+import cooler.tools
 
 
-def sample_pixels_approx(pixels, frac):
+def mend_split_pixels(pixels):
+    return (
+        pd.DataFrame(pixels)
+        .groupby(['bin1_id', 'bin2_id'])['count']
+        .sum()
+        .reset_index()
+    )
+
+
+def sample_pixels_approx(pixels, frac, sum_split):
     pixels['count'] = np.random.binomial(pixels['count'], frac)
     mask = pixels['count'] > 0
 
     if issubclass(type(pixels), pd.DataFrame):
         pixels = pixels[mask]
     elif issubclass(type(pixels), dict):
-        pixels = {k:arr[mask] for k, arr in pixels.items()}
+        pixels = {k: arr[mask] for k, arr in pixels.items()}
+
     return pixels
 
 
-def sample_pixels_exact(pixels, count):
+def sample_pixels_exact(pixels, count, sum_split):
     cumcount = np.cumsum(np.asarray(pixels['count']))
     total = cumcount[-1]
     n_pixels = cumcount.shape[0]
@@ -93,8 +104,20 @@ def sample_cooler(clr, out_clr_path, count=None, frac=None, exact=False,
         raise ValueError('The number of contacts in a sample cannot exceed '
                          'that in the original dataset.')
 
+    # repair occasional split pixels in older zoomified coolers
+    sum_split = False
+    if 'cooler-' in clr.info.get('generated-by', ''):
+        lib_versionstr = clr.info['generated-by'].split('-', 1)[1]
+        lib_created = tuple(map(int, lib_versionstr.split('.')[:3]))
+        if lib_created < (0, 8, 5):
+            sum_split = True
+
     if exact:
-        pixels = sample_pixels_exact(clr.pixels()[:], count)
+        pixels = clr.pixels()[:]
+        if sum_split:
+            pixels = mend_split_pixels(pixels)
+
+        pixels = sample_pixels_exact(pixels, count)
         cooler.create_cooler(
             out_clr_path, clr.bins()[:], pixels, ordered=True)
 
@@ -105,7 +128,14 @@ def sample_cooler(clr, out_clr_path, count=None, frac=None, exact=False,
                                map=map_func,
                                chunksize=chunksize)
             .pipe(_extract_pixel_chunk)
-            .pipe(sample_pixels_approx, frac=frac)
+        )
+
+        if sum_split:
+            pipeline = pipeline.pipe(mend_split_pixels)
+
+        pipeline = (
+            pipeline
+            .pipe(sample_pixels_approx, frac=frac, sum_split=sum_split)
         )
 
         cooler.create_cooler(
