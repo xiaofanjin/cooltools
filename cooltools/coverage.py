@@ -96,7 +96,6 @@ def get_coverage(clr,
     
     if ignore_diags:
         chunks = chunks.pipe(_zero_diags, n_diags=ignore_diags)
-    print(ignore_diags)
         
     n_bins = clr.info['nbins']
     covs = (

@@ -7,6 +7,9 @@ import numpy as np
 import numba
 import cooler
 from functools import partial
+import cvxpy as cp
+import datetime
+
 
 from ._numutils import (
     iterative_correction_symmetric as _iterative_correction_symmetric,
@@ -417,6 +420,173 @@ def is_symmetric(mat):
     maxDiff = np.abs(mat - mat.T).max()
     return maxDiff < stochastic_sd(mat) * 1e-7 + 1e-5
 
+def optChunkWmask(x,YY,leftBound,rightBound,mask):
+    #determine relevant sections of mask matrix given chunk location
+    maskRelevant=np.any(mask[:,leftBound:rightBound]>0, axis=1)
+    
+    #cvxpy variable xx represents chunk of x to be optimized
+    xx = cp.Variable((rightBound-leftBound,1))
+    
+    #define objective function
+    obj = cp.Minimize(cp.norm(cp.multiply(mask[maskRelevant,leftBound:rightBound],YY[maskRelevant,leftBound:rightBound] - x[maskRelevant]*xx.T), 'fro'))
+    prob = cp.Problem(obj)
+    
+    #solve using SCS solver
+    prob.solve(solver=cp.SCS, max_iters=1000, eps=.01)  # Returns the optimal value.
+    
+    #if failed, say why, otherwise update x with 0.9 learning rate
+    if prob.status!="optimal":
+        print(prob.status)
+    else:
+        diffx=xx.value-x[leftBound:rightBound]
+        x[leftBound:rightBound]=x[leftBound:rightBound]+0.9*diffx 
+    return x
+
+def cvxOptEig(mat, maskMin=3, maskMax=2000, maxIters=50, eps=0.1):
+    """Perform an eigenvector decomposition, taking into account only
+    bins that are close to the diagonal of matrix. Uses cvxpy to solve 
+    for argmin(x) {[mat-x*x.T] .* mask} where mat is input matrix, 
+    x*x.T is outer product of 'eigenvector' x, and mask is a boolean 
+    matrix with same shape as mat, 1's for bins more than minDist and less
+    than maxDist from diagonal - 0's elsewhere.
+
+    Parameters
+    ----------
+
+    mat : np.ndarray
+        A square matrix
+
+    minDist : int
+        minimum distance from diagonal to consider when generating mask
+
+    maxDist : int
+        maximum distance from diagonal to consider when generating mask
+
+    maxIters : int
+        maximum number of cvxpy iterations
+        
+    eps : float
+        tolerance threshold for termination
+
+    Returns
+    -------
+
+    x : np.ndarray
+        optimized eigenvector
+
+    """    
+    #get shape of matrix and make mask
+    m=mat.shape[0] 
+    colMatrix=np.tile(np.arange(m), (m,1))
+    distMatrix=np.abs(colMatrix-colMatrix.T)
+    mask=np.multiply(distMatrix>=maskMin,distMatrix<=maskMax).astype(int)
+    
+    #split optimizing vector into chunks
+    chunkSize=np.floor(np.sqrt(m)).astype(int)
+    chunkBoundaries=np.append(np.arange(0,m,chunkSize),m)
+    numChunks=np.ceil(m/chunkSize)
+
+    #initialize eigenvector
+    x=np.random.randn(m,1)
+    YY=mat
+
+    #initialize array that stores norms of changes to each chunk per iteration
+    #when these norms get small enough, chunks have stopped changing and can stop
+    chunkNormArray=1e5*np.ones((numChunks.astype(int),1))
+    
+    #loop through cvxpy iterations
+    for iterInd in range(maxIters):
+        #loop through chunks of vector
+        for chunkInd,leftBound in enumerate(chunkBoundaries[:-1]):
+            rightBound=chunkBoundaries[chunkInd+1]
+            x_old=np.copy(x)
+            x=optChunkWmask(x,YY,leftBound,rightBound, mask)
+            chunkNorm=np.linalg.norm(x_old-x)
+            if chunkNorm>0:
+                chunkNormArray[chunkInd]=np.min(chunkNorm)
+            print(iterInd, chunkInd, datetime.datetime.now(), np.linalg.norm(x_old-x))
+        maxNorm=np.max(chunkNormArray)
+        print('maxNorm=',maxNorm)
+        if maxNorm<eps:
+            break
+            
+    return x
+
+def get_eig_CVX(mat, mask_zero_rows=False, subtract_mean=False, divide_by_mean=False):
+    """Perform an eigenvector decomposition.
+
+    Parameters
+    ----------
+
+    mat : np.ndarray
+        A square matrix, must not contain nans, infs or zero rows.
+
+    mask_zero_rows : bool
+        If True, mask empty rows/columns before eigenvector decomposition.
+        Works only with symmetric matrices.
+
+    subtract_mean : bool
+        If True, subtract the mean from the matrix.
+
+    divide_by_mean : bool
+        If True, divide the matrix by its mean.
+
+    Returns
+    -------
+
+    eigvecs : np.ndarray
+        An array of eigenvectors (in rows), sorted by a decreasing absolute
+        eigenvalue. In this case, using cvx to calculate eigvecs rather than
+        eigenvector-decomposition, so only one eigenvector is returned
+
+    eigvals : np.ndarray
+        An array of sorted eigenvalues. In this case, eigvals=-1
+
+    """
+    n=1
+    symmetric = is_symmetric(mat)
+    if (symmetric
+        and np.sum(np.sum(np.abs(mat), axis=0) == 0) > 0
+        and not mask_zero_rows
+        ):
+        warnings.warn(
+            "The matrix contains empty rows/columns and is symmetric. "
+            "Mask the empty rows with remove_zeros=True")
+
+    if mask_zero_rows:
+        if not is_symmetric(mat):
+            raise ValueError('The input matrix must be symmetric!')
+
+        mask = np.sum(np.abs(mat), axis=0) != 0
+        mat_collapsed = mat[mask, :][:, mask]
+        eigvecs_collapsed, eigvals = get_eig_CVX(
+            mat_collapsed,
+            mask_zero_rows=False,
+            subtract_mean=subtract_mean,
+            divide_by_mean=divide_by_mean)
+        n_rows = mat.shape[0]
+        eigvecs = np.full((n, n_rows), np.nan)
+        for i in range(n):
+            eigvecs[i][mask] = eigvecs_collapsed[i]
+
+        return eigvecs, eigvals
+    else:
+        mat = mat.astype(np.float, copy=True)  # make a copy, ensure float
+        mean = np.mean(mat)
+
+        if subtract_mean:
+            mat -= mean
+        if divide_by_mean:
+            mat /= mean
+
+        eigvecs = cvxOptEig(mat)
+        eigvals = -np.ones(1)
+
+        order = np.argsort(-np.abs(eigvals))
+        eigvals = eigvals[order]
+        eigvecs = eigvecs.T[order]
+
+        return eigvecs, eigvals
 
 def get_eig(mat, n=3, mask_zero_rows=False, subtract_mean=False, divide_by_mean=False):
     """Perform an eigenvector decomposition.
